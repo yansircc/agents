@@ -90,6 +90,18 @@ export interface ResumeHandshakeHost {
  * handler registration timing stays host-owned.
  */
 export class ResumeHandshake {
+  /**
+   * The request each connection has already ACKed (#2703). A connection is
+   * notified more than once for the same request — proactively from onConnect
+   * and again in response to its own `STREAM_RESUME_REQUEST` — and the client
+   * dedupes the second notice (it never ACKs twice for the same request). If the
+   * notice re-parked the connection, it would stay excluded from live broadcast
+   * with no ACK coming, so it would receive nothing until the stream ended.
+   * Only the request a connection ACKed is remembered; a new request id parks it
+   * again.
+   */
+  private readonly _acked = new Map<string, string>();
+
   constructor(private readonly host: ResumeHandshakeHost) {}
 
   /**
@@ -108,17 +120,22 @@ export class ResumeHandshake {
   notifyStreamResuming(connection: Connection, probeId?: string): void {
     const { resumableStream, pendingResumeConnections } = this.host;
     if (!resumableStream.hasActiveStream()) return;
+    const requestId = resumableStream.activeRequestId;
     const sent = sendIfOpen(
       connection,
       JSON.stringify({
         type: CHAT_MESSAGE_TYPES.STREAM_RESUMING,
-        id: resumableStream.activeRequestId,
+        id: requestId,
         ...(probeId ? { probeId } : {})
       })
     );
     if (sent) {
       // Add to pending set — excluded from live broadcasts until they ACK to
-      // receive the full stream replay.
+      // receive the full stream replay. A connection that already ACKed this
+      // request is being re-notified (its own probe after the ACK, #2703); it
+      // has the replay and will not ACK again, so parking it here would starve
+      // it for the rest of the stream.
+      if (this._acked.get(connection.id) === requestId) return;
       pendingResumeConnections.add(connection.id);
     }
   }
@@ -225,6 +242,18 @@ export class ResumeHandshake {
       : true;
   }
 
+  /**
+   * Remember that `connection` ACKed `requestId` for the active stream (#2703),
+   * and drop entries for other requests so the map never outlives the stream it
+   * describes (a new request id must park the connection again).
+   */
+  private _recordAck(connectionId: string, requestId: string): void {
+    for (const [id, acked] of this._acked) {
+      if (acked !== requestId) this._acked.delete(id);
+    }
+    this._acked.set(connectionId, requestId);
+  }
+
   /** Handle a client `STREAM_RESUME_ACK` for `requestId`. */
   async handleResumeAck(
     connection: Connection,
@@ -238,6 +267,7 @@ export class ResumeHandshake {
       resumableStream.hasActiveStream() &&
       resumableStream.activeRequestId === requestId
     ) {
+      this._recordAck(connection.id, requestId);
       const orphanedStreamId = resumableStream.replayChunks(
         connection,
         resumableStream.activeRequestId

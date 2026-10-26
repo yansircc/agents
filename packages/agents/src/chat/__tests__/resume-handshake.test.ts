@@ -190,6 +190,102 @@ describe("ResumeHandshake (driver → golden frames)", () => {
     ]);
   });
 
+  it("#2703: a connection that ACKed is not re-parked by its own probe", async () => {
+    const frames: SentFrame[] = [];
+    const pendingResumeConnections = new Set<string>();
+    const { state, resumableStream } = makeStream({
+      active: true,
+      activeRequestId: "req-1"
+    });
+    const handshake = new ResumeHandshake(
+      makeHost({ resumableStream, pendingResumeConnections })
+    );
+    const conn = makeConnection("c1", frames);
+
+    handshake.notifyStreamResuming(conn);
+    expect(pendingResumeConnections.has("c1")).toBe(true);
+
+    await handshake.handleResumeAck(conn, "req-1");
+    expect(pendingResumeConnections.has("c1")).toBe(false);
+
+    // Its own probe lands after the ACK. The notice is still sent (the client
+    // needs an answer to its request), but it must not park the connection
+    // again: the client dedupes the repeat notice and never sends a second ACK,
+    // so a re-parked connection would miss every live chunk until the end.
+    await handshake.handleResumeRequest(conn, "probe-1");
+    expect(frames).toEqual([
+      streamResumingFrame("req-1"),
+      streamResumingFrame("req-1", "probe-1")
+    ]);
+    expect(pendingResumeConnections.has("c1")).toBe(false);
+    expect(state.calls.replayChunks).toEqual(["req-1"]);
+  });
+
+  it("#2703: a repeat notice still parks a connection that has not ACKed", async () => {
+    const frames: SentFrame[] = [];
+    const pendingResumeConnections = new Set<string>();
+    const { resumableStream } = makeStream({
+      active: true,
+      activeRequestId: "req-1"
+    });
+    const handshake = new ResumeHandshake(
+      makeHost({ resumableStream, pendingResumeConnections })
+    );
+    const conn = makeConnection("c1", frames);
+
+    // No ACK in between: both notices are answered, and the connection stays
+    // excluded from live broadcast, because its replay has not been delivered.
+    handshake.notifyStreamResuming(conn);
+    handshake.notifyStreamResuming(conn, "probe-1");
+
+    expect(frames).toEqual([
+      streamResumingFrame("req-1"),
+      streamResumingFrame("req-1", "probe-1")
+    ]);
+    expect(pendingResumeConnections.has("c1")).toBe(true);
+  });
+
+  it("#2703: a new request id parks a connection that ACKed the previous one", async () => {
+    const frames: SentFrame[] = [];
+    const pendingResumeConnections = new Set<string>();
+    const { state, resumableStream } = makeStream({
+      active: true,
+      activeRequestId: "req-1"
+    });
+    const handshake = new ResumeHandshake(
+      makeHost({ resumableStream, pendingResumeConnections })
+    );
+    const conn = makeConnection("c1", frames);
+
+    handshake.notifyStreamResuming(conn);
+    await handshake.handleResumeAck(conn, "req-1");
+
+    // The next turn is a new request: the ACK for the old one says nothing
+    // about this stream, so the connection is parked for it again.
+    state.activeRequestId = "req-2";
+    handshake.notifyStreamResuming(conn);
+
+    expect(pendingResumeConnections.has("c1")).toBe(true);
+  });
+
+  it("#2703: an ACK for a different request does not mark the active one", async () => {
+    const frames: SentFrame[] = [];
+    const pendingResumeConnections = new Set<string>();
+    const { resumableStream } = makeStream({
+      active: true,
+      activeRequestId: "req-1"
+    });
+    const handshake = new ResumeHandshake(
+      makeHost({ resumableStream, pendingResumeConnections })
+    );
+    const conn = makeConnection("c1", frames);
+
+    await handshake.handleResumeAck(conn, "stale-req");
+    handshake.notifyStreamResuming(conn);
+
+    expect(pendingResumeConnections.has("c1")).toBe(true);
+  });
+
   it("REQUEST while a DIFFERENT connection owns the active continuation → RESUME_NONE", async () => {
     const frames: SentFrame[] = [];
     const { resumableStream } = makeStream({
